@@ -112,7 +112,6 @@ local state = {
     lastVisibleCheck = 0,
     lastRefresh = 0,
     currentFovRadius = 120,
-    aiming = false, -- set by UI keybind
     triggerDown = false,
     lastTrigger = 0,
 
@@ -667,20 +666,6 @@ local function onRenderStep(dt)
     updateFovDraw()
 
     state.currentFovRadius = Settings.FOV.Radius
-
-    -- input check (set by UI keybind via state.aiming)
-    if not state.aiming then
-        state.smoothRot = nil
-        dbg("not aiming (state.aiming=false)")
-        if Settings.AutoUnlockOnDeath and state.lockedTarget then
-            if not state.lockedTarget.char
-            or not state.lockedTarget.char.Parent
-            or state.lockedTarget.humanoid.Health <= 0 then
-                state.lockedTarget = nil
-            end
-        end
-        return
-    end
 
     local now = tick()
 
