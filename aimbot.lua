@@ -119,6 +119,7 @@ local state = {
     silentTarget = nil,
     lastSilentRefresh = 0,
     silentHooksInstalled = false,
+    smoothRot = nil,
 }
 
 --// Forward declarations (defined later, used by silent aim hooks)
@@ -591,30 +592,30 @@ local function shouldKeepLocked(newTarget)
     return false
 end
 
---// Smoothing functions
-local function applySmoothing(currentCFrame, targetPos)
-    local targetCFrame = CFrame.new(camera.CFrame.Position, targetPos)
-    if not Settings.Smoothing.Enabled then
-        return targetCFrame
-    end
-
-    local method = Settings.Smoothing.Method
-    local speed = Settings.Smoothing.Speed
-    speed = math.clamp(speed, 0.001, 0.999)
-
-    if method == "Slerp" then
-        local r = currentCFrame.Rotation:Slerp(targetCFrame.Rotation, speed)
-        return CFrame.new(currentCFrame.Position) * r
-    else
-        -- Lerp and Exponential both use CFrame:Lerp
-        return currentCFrame:Lerp(targetCFrame, speed)
-    end
-end
-
---// Aim camera
+--// Aim camera — accumulate smoothed rotation across frames
 local function aimAt(pos)
-    local smoothed = applySmoothing(camera.CFrame, pos)
-    camera.CFrame = smoothed
+    local camPos = camera.CFrame.Position
+    local targetCFrame = CFrame.new(camPos, pos)
+    local targetRot = targetCFrame.Rotation
+
+    if not Settings.Smoothing.Enabled then
+        state.smoothRot = targetRot
+        camera.CFrame = targetCFrame
+        return
+    end
+
+    local speed = math.clamp(Settings.Smoothing.Speed, 0.001, 0.999)
+    local currentRot = state.smoothRot or camera.CFrame.Rotation
+
+    local smoothedRot
+    if Settings.Smoothing.Method == "Slerp" then
+        smoothedRot = currentRot:Slerp(targetRot, speed)
+    else
+        smoothedRot = currentRot:Lerp(targetRot, speed)
+    end
+
+    state.smoothRot = smoothedRot
+    camera.CFrame = CFrame.new(camPos) * smoothedRot
 end
 
 --// Trigger bot
@@ -652,6 +653,15 @@ local function runTriggerBot(target)
 end
 
 --// Main loop — use BindToRenderStep with Camera priority so aim applies after game camera updates
+local lastDebug = 0
+local function dbg(msg)
+    local now = tick()
+    if now - lastDebug >= 1 then
+        lastDebug = now
+        print("[LumaAimbot] " .. msg)
+    end
+end
+
 local function onRenderStep(dt)
     if not Settings.Enabled then return end
     updateFovDraw()
@@ -660,6 +670,8 @@ local function onRenderStep(dt)
 
     -- input check (set by UI keybind via state.aiming)
     if not state.aiming then
+        state.smoothRot = nil
+        dbg("not aiming (state.aiming=false)")
         if Settings.AutoUnlockOnDeath and state.lockedTarget then
             if not state.lockedTarget.char
             or not state.lockedTarget.char.Parent
@@ -694,6 +706,7 @@ local function onRenderStep(dt)
 
         local newTarget = findTarget()
         if newTarget then
+            dbg("target found: " .. tostring(newTarget.player and newTarget.player.Name or "?"))
             if shouldKeepLocked(newTarget) then
                 -- keep old target, update its position
                 local myChar = lp.Character
@@ -739,12 +752,17 @@ local function onRenderStep(dt)
     end
 
     if target and target.position then
-        -- visibility recheck if needed
         if not target.visible and not Settings.Wallbang then
+            dbg("target not visible, unlocking")
             state.lockedTarget = nil
+            state.smoothRot = nil
             return
         end
+        dbg("aiming at target pos=" .. tostring(target.position))
         aimAt(target.position)
+    else
+        dbg("no target or no position")
+        state.smoothRot = nil
     end
 
     runTriggerBot(target)
@@ -774,3 +792,4 @@ getgenv().AimbotUnload = function()
 end
 
 return Settings
+
