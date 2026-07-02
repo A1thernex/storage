@@ -121,6 +121,9 @@ local state = {
     silentHooksInstalled = false,
 }
 
+--// Forward declarations (defined later, used by silent aim hooks)
+local findTarget, getTargetPos, screenDistance, isVisible
+
 --// Silent aim: get current target
 local function getSilentTargetPos()
     local sa = Settings.SilentAim
@@ -396,7 +399,7 @@ local function resolvePredictionConfig(override)
 end
 
 --// Get target position with prediction
-local function getTargetPos(hrp, targetChar, targetHrp, configOverride)
+function getTargetPos(hrp, targetChar, targetHrp, configOverride)
     if not targetHrp then return nil end
     local bone = Settings.Bone
     local part = getAimPart(targetChar, bone)
@@ -420,7 +423,7 @@ local raycastParams = RaycastParams.new()
 raycastParams.FilterType = Enum.RaycastFilterType.Exclude
 raycastParams.IgnoreWater = true
 
-local function isVisible(fromPos, targetPart)
+function isVisible(fromPos, targetPart)
     if Settings.Wallbang or not Settings.RequireVisible then
         return true
     end
@@ -431,7 +434,7 @@ local function isVisible(fromPos, targetPart)
 end
 
 --// World-to-screen distance
-local function screenDistance(worldPos)
+function screenDistance(worldPos)
     local screenPos, onScreen = camera:WorldToViewportPoint(worldPos)
     if not onScreen then return math.huge end
     local mousePos = UserInputService:GetMouseLocation()
@@ -533,7 +536,7 @@ local function scoreCandidate(c, myHrp)
 end
 
 --// Find best target
-local function findTarget()
+function findTarget()
     local myChar = lp.Character
     if not myChar then return nil end
     local myHrp = myChar:FindFirstChild("HumanoidRootPart")
@@ -597,16 +600,13 @@ local function applySmoothing(currentCFrame, targetPos)
 
     local method = Settings.Smoothing.Method
     local speed = Settings.Smoothing.Speed
-    speed = math.clamp(speed, 0.001, 1)
+    speed = math.clamp(speed, 0.001, 0.999)
 
-    if method == "Lerp" then
-        return currentCFrame:Lerp(targetCFrame, speed)
-    elseif method == "Exponential" then
-        return currentCFrame:Lerp(targetCFrame, speed)
-    elseif method == "Slerp" then
+    if method == "Slerp" then
         local r = currentCFrame.Rotation:Slerp(targetCFrame.Rotation, speed)
         return CFrame.new(currentCFrame.Position) * r
     else
+        -- Lerp and Exponential both use CFrame:Lerp
         return currentCFrame:Lerp(targetCFrame, speed)
     end
 end
@@ -651,8 +651,8 @@ local function runTriggerBot(target)
     end
 end
 
---// Main loop
-RunService.RenderStepped:Connect(function(dt)
+--// Main loop — use BindToRenderStep with Camera priority so aim applies after game camera updates
+local function onRenderStep(dt)
     if not Settings.Enabled then return end
     updateFovDraw()
 
@@ -753,7 +753,9 @@ RunService.RenderStepped:Connect(function(dt)
     if Settings.SilentAim.Enabled and not Settings.SilentAim.UseAimbotTarget then
         state.silentTarget = target
     end
-end)
+end
+
+RunService:BindToRenderStep("LumaAimbot", Enum.RenderPriority.Camera.Value + 1, onRenderStep)
 
 --// Install silent aim hooks
 installSilentHooks()
@@ -763,6 +765,9 @@ getgenv().AimbotSettings = Settings
 getgenv().AimbotState = state
 
 getgenv().AimbotUnload = function()
+    pcall(function()
+        RunService:UnbindFromRenderStep("LumaAimbot")
+    end)
     if fovCircle then fovCircle:Remove() end
     Settings.Enabled = false
     Settings.SilentAim.Enabled = false
