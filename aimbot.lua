@@ -1,7 +1,7 @@
-local Players = cloneref(game:GetService("Players"))
-local RunService = cloneref(game:GetService("RunService"))
-local UserInputService = cloneref(game:GetService("UserInputService"))
-local Workspace = cloneref(game:GetService("Workspace"))
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
 
 local lp = Players.LocalPlayer
 local camera = Workspace.CurrentCamera
@@ -236,29 +236,23 @@ local function installSilentHooks()
     end
 
     --// Hook BasePart:Raycast (some games raycast from the weapon part)
+    -- All BaseParts share the same Raycast method, so hooking one hooks all
     if hooks.Raycast then
-        local partMt = getrawmetatable(game:GetService("Workspace").Terrain)
-        -- BasePart.Raycast is on BasePart class
-        local oldPartRaycast = game:GetService("Workspace").Part and game:GetService("Workspace").Part.Raycast
-        -- Use hookmetamethod approach for BasePart:Raycast since it's a method on all parts
-        local oldIndex
-        oldIndex = hookmetamethod(game, "__index", function(self, key)
-            if key == "Raycast" and typeof(self) == "Instance" and self:IsA("BasePart") then
-                local orig = oldIndex(self, key)
-                if type(orig) == "function" and sa.Enabled then
-                    return function(partSelf, origin, direction, params, ...)
-                        local targetPos, targetPart = getSilentTargetPos()
-                        if targetPos and targetPart then
-                            local result = makeRaycastResult(origin, direction, params, targetPos, targetPart)
-                            if result then return result end
-                        end
-                        return orig(partSelf, origin, direction, params, ...)
+        local tempPart = Instance.new("Part")
+        local oldPartRaycast = tempPart.Raycast
+        tempPart:Destroy()
+        if oldPartRaycast then
+            hookfunction(oldPartRaycast, function(self, origin, direction, params, ...)
+                if typeof(self) == "Instance" and self:IsA("BasePart") and sa.Enabled then
+                    local targetPos, targetPart = getSilentTargetPos()
+                    if targetPos and targetPart then
+                        local result = makeRaycastResult(origin, direction, params, targetPos, targetPart)
+                        if result then return result end
                     end
                 end
-                return orig
-            end
-            return oldIndex(self, key)
-        end)
+                return oldPartRaycast(self, origin, direction, params, ...)
+            end)
+        end
     end
 
     --// Hook legacy FindPartOnRay, FindPartOnRayWithIgnoreList, FindPartOnRayWithWhitelist
@@ -273,16 +267,10 @@ local function installSilentHooks()
                         if targetPos and targetPart then
                             local origin = ray.Origin
                             local newDir = targetPos - origin
-                            if sa.Wallbang then
-                                -- use whitelist with target only
-                                local newRay = Ray.new(origin, newDir)
-                                if methodName == "FindPartOnRayWithWhitelist" then
-                                    return oldMethod(self, newRay, { targetPart.Parent }, ...)
-                                else
-                                    return oldMethod(self, newRay, { targetPart.Parent }, ...)
-                                end
-                            end
                             local newRay = Ray.new(origin, newDir)
+                            if sa.Wallbang and methodName == "FindPartOnRayWithWhitelist" then
+                                return oldMethod(self, newRay, { targetPart.Parent }, ...)
+                            end
                             return oldMethod(self, newRay, ...)
                         end
                     end
@@ -503,6 +491,7 @@ end
 
 --// Get target position with prediction
 local function getTargetPos(hrp, targetChar, targetHrp, configOverride)
+    if not targetHrp then return nil end
     local bone = Settings.Bone
     local part = getAimPart(targetChar, bone)
     if not part then return nil end
