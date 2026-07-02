@@ -148,26 +148,21 @@ local function getSilentTargetPos()
     local targetHrp = target.char:FindFirstChild("HumanoidRootPart")
     if not targetHrp then return nil end
 
-    -- use prediction-aware position
     local pos, part = getTargetPos(myHrp, target.char, targetHrp, sa.Prediction)
     if not pos or not part then return nil end
 
-    -- visibility check
     if sa.RequireVisible and not sa.Wallbang then
         if not isVisible(camera.CFrame.Position, part) then return nil end
     end
 
-    -- fov check
     if sa.RequireFOV then
         local sdist = screenDistance(pos)
         if sdist > sa.FOVRadius then return nil end
     end
 
-    -- distance check
     local dist = (myHrp.Position - pos).Magnitude
     if dist > sa.MaxDistance then return nil end
 
-    -- hit chance
     if sa.HitChance < 100 then
         if math.random(1, 100) > sa.HitChance then return nil end
     end
@@ -175,44 +170,14 @@ local function getSilentTargetPos()
     return pos, part, target
 end
 
---// Construct a fake RaycastResult by doing a real raycast towards target
-local function makeRaycastResult(origin, direction, params, targetPos, targetPart)
-    local sa = Settings.SilentAim
-
-    if sa.Wallbang then
-        -- force include only the target character
-        local newParams = RaycastParams.new()
-        newParams.FilterType = Enum.RaycastFilterType.Include
-        newParams.FilterDescendantsInstances = { targetPart.Parent }
-        newParams.IgnoreWater = true
-        newParams.RespectCanCollide = params and params.RespectCanCollide or false
-        local dir = (targetPos - origin)
-        local result = Workspace:Raycast(origin, dir, newParams)
-        if result then return result end
-        -- fallback: if raycast didn't hit (edge case), construct manually
-    end
-
-    -- redirect direction towards target
-    local newDir = targetPos - origin
-    local dist = newDir.Magnitude
-    -- preserve original direction magnitude or use distance, whichever is larger
-    if direction.Magnitude > dist then
-        newDir = newDir.Unit * direction.Magnitude
-    end
-
-    local result = Workspace:Raycast(origin, newDir, params)
-    if result then return result end
-
-    -- if nothing hit (shouldn't happen if target visible), return nil
-    -- construct a synthetic result pointing at target
-    return nil
+--// Direction helper
+local function getDirection(origin, position)
+    return (position - origin).Unit * 1000
 end
 
---// Build a synthetic RaycastResult-like table (for edge cases)
--- RaycastResult is a userdata, we can't construct it directly.
--- Best practice: redirect the ray so engine produces real result.
-
 --// Silent aim hook installation
+local mouse = lp:GetMouse()
+
 local function installSilentHooks()
     if state.silentHooksInstalled then return end
     state.silentHooksInstalled = true
@@ -220,114 +185,111 @@ local function installSilentHooks()
     local sa = Settings.SilentAim
     local hooks = sa.Hooks
 
-    --// Hook WorldRoot:Raycast
-    if hooks.Raycast then
-        local oldRaycast
-        oldRaycast = hookfunction(Workspace.Raycast, function(self, origin, direction, params, ...)
-            if self == Workspace and sa.Enabled then
-                local targetPos, targetPart = getSilentTargetPos()
-                if targetPos and targetPart then
-                    local result = makeRaycastResult(origin, direction, params, targetPos, targetPart)
-                    if result then return result end
-                end
-            end
-            return oldRaycast(self, origin, direction, params, ...)
-        end)
-    end
+    --// Hook __namecall for all method-based hooks
+    local oldNamecall
+    oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(...)
+        local method = getnamecallmethod()
+        local args = { ... }
+        local self = args[1]
 
-    --// Hook BasePart:Raycast (some games raycast from the weapon part)
-    -- All BaseParts share the same Raycast method, so hooking one hooks all
-    if hooks.Raycast then
-        local tempPart = Instance.new("Part")
-        local oldPartRaycast = tempPart.Raycast
-        tempPart:Destroy()
-        if oldPartRaycast then
-            hookfunction(oldPartRaycast, function(self, origin, direction, params, ...)
-                if typeof(self) == "Instance" and self:IsA("BasePart") and sa.Enabled then
+        if not sa.Enabled or checkcaller() then
+            return oldNamecall(...)
+        end
+
+        --// Raycast (WorldRoot + BasePart)
+        if hooks.Raycast and method == "Raycast" then
+            if typeof(self) == "Instance" and (self == Workspace or self:IsA("BasePart")) then
+                if typeof(args[2]) == "Vector3" and typeof(args[3]) == "Vector3" then
                     local targetPos, targetPart = getSilentTargetPos()
                     if targetPos and targetPart then
-                        local result = makeRaycastResult(origin, direction, params, targetPos, targetPart)
-                        if result then return result end
+                        if sa.Wallbang and args[4] then
+                            local params = args[4]
+                            if typeof(params) == "RaycastParams" then
+                                params.FilterType = Enum.RaycastFilterType.Include
+                                params.FilterDescendantsInstances = { targetPart.Parent }
+                            end
+                        end
+                        args[3] = getDirection(args[2], targetPos)
+                        return oldNamecall(table.unpack(args))
                     end
                 end
-                return oldPartRaycast(self, origin, direction, params, ...)
-            end)
-        end
-    end
+            end
 
-    --// Hook legacy FindPartOnRay, FindPartOnRayWithIgnoreList, FindPartOnRayWithWhitelist
-    if hooks.LegacyRay then
-        for _, methodName in ipairs({ "FindPartOnRay", "FindPartOnRayWithIgnoreList", "FindPartOnRayWithWhitelist" }) do
-            local method = Workspace[methodName]
-            if method then
-                local oldMethod
-                oldMethod = hookfunction(method, function(self, ray, ...)
-                    if self == Workspace and sa.Enabled then
-                        local targetPos, targetPart = getSilentTargetPos()
-                        if targetPos and targetPart then
-                            local origin = ray.Origin
-                            local newDir = targetPos - origin
-                            local newRay = Ray.new(origin, newDir)
-                            if sa.Wallbang and methodName == "FindPartOnRayWithWhitelist" then
-                                return oldMethod(self, newRay, { targetPart.Parent }, ...)
-                            end
-                            return oldMethod(self, newRay, ...)
-                        end
+        --// Legacy ray methods
+        elseif hooks.LegacyRay and (method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist") then
+            if self == Workspace and typeof(args[2]) == "Ray" then
+                local targetPos, targetPart = getSilentTargetPos()
+                if targetPos and targetPart then
+                    local origin = args[2].Origin
+                    args[2] = Ray.new(origin, getDirection(origin, targetPos))
+                    if sa.Wallbang and method == "FindPartOnRayWithWhitelist" then
+                        args[3] = { targetPart.Parent }
                     end
-                    return oldMethod(self, ray, ...)
-                end)
+                    return oldNamecall(table.unpack(args))
+                end
+            end
+
+        --// Shape casts
+        elseif (hooks.Spherecast and method == "Spherecast") or (hooks.Blockcast and method == "Blockcast") or (hooks.Shaftcast and method == "Shaftcast") then
+            if self == Workspace and typeof(args[2]) == "Vector3" and typeof(args[3]) == "Vector3" then
+                local targetPos = getSilentTargetPos()
+                if targetPos then
+                    args[3] = getDirection(args[2], targetPos)
+                    return oldNamecall(table.unpack(args))
+                end
+            end
+
+        --// Camera ray methods
+        elseif hooks.CameraRay and (method == "ScreenPointToRay" or method == "ViewportPointToRay") then
+            if self == camera then
+                local targetPos = getSilentTargetPos()
+                if targetPos then
+                    local origin = camera.CFrame.Position
+                    local dir = (targetPos - origin).Unit
+                    local depth = args[4] or 0
+                    return Ray.new(origin + dir * depth, dir)
+                end
+            end
+
+        --// Overlap queries
+        elseif hooks.Overlap and (method == "GetPartsInPart" or method == "GetPartBoundsInBox" or method == "GetPartBoundsInRadius") then
+            if self == Workspace then
+                local _, targetPart = getSilentTargetPos()
+                if targetPart then
+                    local result = oldNamecall(table.unpack(args))
+                    if type(result) == "table" then
+                        local found = false
+                        for _, part in ipairs(result) do
+                            if part == targetPart or part:IsDescendantOf(targetPart.Parent) then
+                                found = true
+                                break
+                            end
+                        end
+                        if not found then
+                            table.insert(result, targetPart)
+                        end
+                        return result
+                    end
+                end
             end
         end
-    end
 
-    --// Hook Spherecast, Blockcast, Shaftcast
-    if hooks.Spherecast or hooks.Blockcast or hooks.Shaftcast then
-        local castMethods = {}
-        if hooks.Spherecast then table.insert(castMethods, "Spherecast") end
-        if hooks.Blockcast then table.insert(castMethods, "Blockcast") end
-        if hooks.Shaftcast then table.insert(castMethods, "Shaftcast") end
+        return oldNamecall(...)
+    end))
 
-        for _, methodName in ipairs(castMethods) do
-            local method = Workspace[methodName]
-            if method then
-                local oldMethod
-                oldMethod = hookfunction(method, function(self, ...)
-                    if self == Workspace and sa.Enabled then
-                        local targetPos, targetPart = getSilentTargetPos()
-                        if targetPos and targetPart then
-                            -- redirect the ray origin/direction to point at target
-                            local args = { ... }
-                            -- signature: (origin, direction, radius/cframe, params)
-                            -- we modify direction to point at target
-                            if typeof(args[1]) == "Vector3" and typeof(args[2]) == "Vector3" then
-                                local origin = args[1]
-                                args[2] = targetPos - origin
-                            end
-                            return oldMethod(self, table.unpack(args))
-                        end
-                    end
-                    return oldMethod(self, ...)
-                end)
-            end
-        end
-    end
-
-    --// Hook Mouse properties via __index
+    --// Hook __index for Mouse properties
     if hooks.MouseHit then
-        local mouse = lp:GetMouse()
         local oldIndex
-        oldIndex = hookmetamethod(mouse, "__index", function(self, key)
-            if sa.Enabled and self == mouse then
+        oldIndex = hookmetamethod(game, "__index", newcclosure(function(self, key)
+            if sa.Enabled and not checkcaller() and self == mouse then
                 local targetPos, targetPart = getSilentTargetPos()
                 if targetPos and targetPart then
                     if key == "Hit" or key == "hit" then
                         local camPos = camera.CFrame.Position
-                        local dir = targetPos - camPos
-                        return CFrame.new(targetPos, targetPos + dir)
+                        return CFrame.new(targetPos, targetPos + (targetPos - camPos))
                     elseif key == "Target" or key == "target" then
                         return targetPart
                     elseif key == "TargetSurface" then
-                        -- return a surface facing the camera
                         local normal = (camera.CFrame.Position - targetPos).Unit
                         local bestFace = Enum.NormalId.Front
                         local bestDot = -math.huge
@@ -336,8 +298,7 @@ local function installSilentHooks()
                             Enum.NormalId.Left, Enum.NormalId.Right,
                             Enum.NormalId.Top, Enum.NormalId.Bottom,
                         }) do
-                            local faceNormal = Vector3.FromNormalId(face)
-                            local dot = faceNormal:Dot(normal)
+                            local dot = Vector3.FromNormalId(face):Dot(normal)
                             if dot > bestDot then
                                 bestDot = dot
                                 bestFace = face
@@ -346,69 +307,14 @@ local function installSilentHooks()
                         return bestFace
                     elseif key == "UnitRay" then
                         local camPos = camera.CFrame.Position
-                        local dir = (targetPos - camPos).Unit
-                        return Ray.new(camPos, dir)
+                        return Ray.new(camPos, (targetPos - camPos).Unit)
                     elseif key == "Origin" then
                         return camera.CFrame.Position
                     end
                 end
             end
             return oldIndex(self, key)
-        end)
-    end
-
-    --// Hook Camera:ScreenPointToRay, ViewportPointToRay
-    if hooks.CameraRay then
-        for _, methodName in ipairs({ "ScreenPointToRay", "ViewportPointToRay" }) do
-            local method = camera[methodName]
-            if method then
-                local oldMethod
-                oldMethod = hookfunction(method, function(self, x, y, depth, ...)
-                    if self == camera and sa.Enabled then
-                        local targetPos, targetPart = getSilentTargetPos()
-                        if targetPos and targetPart then
-                            local origin = self.CFrame.Position
-                            local dir = (targetPos - origin).Unit
-                            return Ray.new(origin + dir * (depth or 0), dir)
-                        end
-                    end
-                    return oldMethod(self, x, y, depth, ...)
-                end)
-            end
-        end
-    end
-
-    --// Hook overlap queries: GetPartsInPart, GetPartBoundsInBox, GetPartBoundsInRadius
-    if hooks.Overlap then
-        for _, methodName in ipairs({ "GetPartsInPart", "GetPartBoundsInBox", "GetPartBoundsInRadius" }) do
-            local method = Workspace[methodName]
-            if method then
-                local oldMethod
-                oldMethod = hookfunction(method, function(self, ...)
-                    if self == Workspace and sa.Enabled then
-                        local targetPos, targetPart = getSilentTargetPos()
-                        if targetPos and targetPart then
-                            -- include the target part in results
-                            local args = { ... }
-                            local result = oldMethod(self, ...)
-                            -- check if target part is already in results
-                            local found = false
-                            for _, part in ipairs(result) do
-                                if part == targetPart or part:IsDescendantOf(targetPart.Parent) then
-                                    found = true
-                                    break
-                                end
-                            end
-                            if not found then
-                                table.insert(result, targetPart)
-                            end
-                            return result
-                        end
-                    end
-                    return oldMethod(self, ...)
-                end)
-            end
-        end
+        end))
     end
 end
 
